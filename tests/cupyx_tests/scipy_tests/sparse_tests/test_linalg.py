@@ -186,6 +186,9 @@ class TestEigsh:
         reason='eigsh works wrong (#5001)',
         raises=AssertionError,
     )
+    # B @ C below is deliberately NON-symmetric (that is gh-5001's setup);
+    # the Hermitian probe correctly flags it, so silence the expected warning
+    @pytest.mark.filterwarnings('ignore:eigsh assumes a Hermitian')
     @testing.for_dtypes('fdFD')
     @testing.numpy_cupy_allclose(rtol=tol, atol=tol, sp_name='sp')
     def test_dense_low_rank(self, dtype, xp, sp):
@@ -239,6 +242,45 @@ class TestEigsh:
         v_v0 = cupy.copysign(ev_v0[:, 0], v)
 
         assert cupy.linalg.norm(v - v_v0) < cupy.linalg.norm(v - v_aux)
+
+
+class TestEigshHermitianCheck:
+
+    def _mk(self, dtype, hermitian):
+        a = testing.shaped_random((50, 50), cupy, dtype=dtype, seed=3)
+        if hermitian:
+            a = (a + a.conj().T) / 2
+        return sparse.csr_matrix(a)
+
+    @testing.for_dtypes('fdFD')
+    def test_non_hermitian_warns(self, dtype):
+        # Lanczos assumes a Hermitian operator; a non-Hermitian input
+        # yields invalid results (NaN / overflow Ritz values, gh-9019).
+        # eigsh probes cheaply and warns instead of failing silently.
+        a = self._mk(dtype, hermitian=False)
+        with pytest.warns(UserWarning, match='non-Hermitian'):
+            sparse.linalg.eigsh(a, k=6, return_eigenvectors=False)
+
+    @testing.for_dtypes('fdFD')
+    def test_hermitian_no_warning(self, dtype):
+        a = self._mk(dtype, hermitian=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', UserWarning)
+            sparse.linalg.eigsh(a, k=6, return_eigenvectors=False)
+
+    def test_dense_non_hermitian_warns(self):
+        a = testing.shaped_random((50, 50), cupy, dtype='d', seed=3)
+        with pytest.warns(UserWarning, match='non-Hermitian'):
+            sparse.linalg.eigsh(a, k=6, return_eigenvectors=False)
+
+    def test_linear_operator_not_probed(self):
+        # LinearOperator inputs cannot be probed cheaply; trusted (SciPy
+        # behaviour). Must not warn.
+        a = self._mk('d', hermitian=True)
+        op = sparse.linalg.aslinearoperator(a)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', UserWarning)
+            sparse.linalg.eigsh(op, k=6, return_eigenvectors=False)
 
 
 @testing.parameterize(*testing.product({

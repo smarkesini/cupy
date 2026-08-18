@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy
 import cupy
 
@@ -9,6 +11,32 @@ from cupy.cuda import device
 from cupy_backends.cuda.libs import cublas as _cublas
 from cupyx.scipy.sparse import _csr
 from cupyx.scipy.sparse.linalg import _interface
+
+
+def _check_hermitian(a, n):
+    """Cheap probabilistic Hermitian check with one fixed probe vector z:
+    compare a @ z against a^H z = conj(a.T @ conj(z)) (a.T is a free view
+    for dense and for CSR<->CSC). The Lanczos recurrence assumes a Hermitian
+    operator; a non-Hermitian input silently yields invalid results (NaN /
+    overflow Ritz values, gh-9019) -- warn instead of returning garbage.
+    Matrices Hermitian up to roundoff pass (sqrt(eps) relative tolerance).
+    LinearOperator inputs cannot be probed cheaply and are trusted, matching
+    SciPy. Cost: two matvecs, negligible next to the solve."""
+    if isinstance(a, _interface.LinearOperator):
+        return
+    z = (cupy.arange(1, n + 1) * (1.0 / n)).astype(a.dtype)
+    z[1::2] *= -1                     # oscillatory + smooth content
+    az = a @ z
+    ahz = cupy.conj(a.T @ cupy.conj(z))
+    nrm = max(float(cupy.linalg.norm(az)), float(cupy.linalg.norm(ahz)))
+    diff = float(cupy.linalg.norm(az - ahz))
+    rtol = float(numpy.sqrt(numpy.finfo(a.dtype).eps))
+    if diff > rtol * nrm:
+        warnings.warn(
+            'eigsh assumes a Hermitian operator, but the input appears '
+            'non-Hermitian (||A z - A^H z|| = {:.3e} vs ||A z|| = {:.3e} '
+            'for a probe vector z); results will be invalid'.format(
+                diff, nrm), UserWarning)
 
 
 def eigsh(a, k=6, *, which='LM', v0=None, ncv=None, maxiter=None,
@@ -76,6 +104,8 @@ def eigsh(a, k=6, *, which='LM', v0=None, ncv=None, maxiter=None,
         maxiter = 10 * n
     if tol == 0:
         tol = numpy.finfo(a.dtype).eps
+
+    _check_hermitian(a, n)
 
     alpha = cupy.zeros((ncv,), dtype=a.dtype)
     beta = cupy.zeros((ncv,), dtype=a.dtype.char.lower())
