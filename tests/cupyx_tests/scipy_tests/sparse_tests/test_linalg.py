@@ -500,6 +500,71 @@ class TestEigshLockedBlockFailsClosed:
 
 
 @testing.with_requires('scipy')
+class TestLanczosGramDecoupleGuard:
+    # gh-10257: the sweep-boundary Gram branch infers a breakdown position
+    # q = j - 1 from the basis row j that lost orthogonality, and then sets
+    # beta[q] = 0. That is only harmless while beta[q] is itself at the
+    # roundoff floor -- decoupling perturbs the spectrum by at most beta[q].
+    # Orthogonality is also lost at perfectly ordinary beta when a Ritz value
+    # converges (Paige), so the position is guarded rather than trusted.
+    #
+    # _lanczos_checked takes the sweep function as an argument, so the state
+    # that reaches the branch is constructed directly instead of searched for.
+
+    @staticmethod
+    def _resweep(V, start, i_end, seed):
+        # A real re-sweep regenerates rows [start, i_end) from the repaired
+        # V[start - 1], so they come back orthonormal to the prefix. The stub
+        # has to do the same: leaving stale rows in place would make the
+        # NEXT row fail the Gram check against the freshly reseeded one, and
+        # the test would be measuring its own scaffolding.
+        b = cupy.asnumpy(V)
+        rs = numpy.random.RandomState(seed)
+        for i in range(start, i_end):
+            w = rs.standard_normal(b.shape[1])
+            for _ in range(2):                   # CGS2
+                w -= b[:i].T @ (b[:i] @ w)
+            b[i] = w / numpy.linalg.norm(w)
+        V[...] = cupy.asarray(b)
+
+    def _call(self, beta_at_q):
+        from cupyx.scipy.sparse.linalg import _eigen
+        n, ncv = 32, 8
+        dtype = numpy.float64
+        rs = numpy.random.RandomState(0)
+        q, _ = numpy.linalg.qr(rs.standard_normal((n, ncv)))
+        basis = numpy.ascontiguousarray(q.T)     # orthonormal rows
+        basis[5] = basis[3]                      # Gram row 5 fails => q = 4
+        beta_np = numpy.full(ncv, 0.5)
+        beta_np[6] = 1e-18        # a coupling at the floor: opens the Gram
+        beta_np[4] = beta_at_q    # the coupling the branch wants to zero
+
+        calls = []
+
+        def lanczos(a, V, u, alpha, beta, start, i_end):
+            calls.append(start)
+            if len(calls) > 1:                   # first sweep: corrupt state
+                self._resweep(V, start, i_end, len(calls))
+
+        return _eigen._lanczos_checked(
+            None, lanczos,
+            cupy.asarray(basis), cupy.zeros(n, dtype=dtype),
+            cupy.ones(ncv, dtype=dtype), cupy.asarray(beta_np),
+            1, ncv, 64.0 * float(numpy.finfo(dtype).eps))
+
+    def test_large_beta_at_gram_position_fails_closed(self):
+        with pytest.raises(RuntimeError, match='too large to decouple'):
+            self._call(0.5)
+
+    def test_small_beta_at_gram_position_is_repaired(self):
+        # Same corrupt basis, but the coupling there really is negligible:
+        # the branch may decouple, and the sweep returns a finite ||A||.
+        anorm, shift, work = self._call(1e-18)
+        assert numpy.isfinite(anorm) and anorm > 0
+        assert shift == 0.0
+        assert work > 0
+
+
 class TestEigshTinyN:
     # n = 2 forces ncv = n - 1 = 1, so the sweep yields a single row and the
     # breakdown walk has no interior beta to inspect. Regression guard: the

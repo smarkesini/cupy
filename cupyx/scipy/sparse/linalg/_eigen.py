@@ -580,6 +580,27 @@ def _lanczos_checked(a, lanczos, V, u, alpha, beta, i_start, i_end,
             for j in numpy.flatnonzero(worst > ortho_rtol):
                 q = int(j) - 1
                 if q >= lo and q not in repaired and (p is None or q < p):
+                    # Only decouple where decoupling is provably harmless.
+                    # The whole design rests on "beta[q] = 0 perturbs the
+                    # spectrum by at most beta[q]", which the `hits` path
+                    # earns with an explicit magnitude test. This path does
+                    # not: q is inferred from a Gram row, and the textbook
+                    # cause of orthogonality loss in Lanczos is Ritz
+                    # convergence (Paige), which happens at perfectly
+                    # ordinary beta. Zeroing a large beta[q] would discard a
+                    # real coupling and silently return the spectrum of a
+                    # different operator, so fail closed instead (gh-10257).
+                    if beta_h[q] > ortho_rtol * anorm_run[q]:
+                        raise RuntimeError(
+                            'eigsh: the Krylov basis lost orthogonality at '
+                            'row {} (max |<V[i], V[j]>| = {:.3e}), but the '
+                            'coupling beta[{}] = {:.3e} there is too large '
+                            'to decouple: dropping it would perturb the '
+                            'spectrum by more than sqrt(eps)*||A|| = {:.3e}. '
+                            'Try a smaller ncv, a different v0, or float64.'
+                            .format(int(j), float(worst[j]), q,
+                                    float(beta_h[q]),
+                                    float(ortho_rtol * anorm_run[q])))
                     p = q
                     break
         # ||A|| estimate and the shift decision must use only the PREFIX up
